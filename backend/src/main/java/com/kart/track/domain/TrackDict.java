@@ -101,6 +101,66 @@ public final class TrackDict {
             "STAFF", "值班人员",
             "SUPERVISOR", "主管");
 
+    // ---------------- 模块九：计时设备 ----------------
+    private static final Map<String, String> DEVICE_ROLE = Map.of(
+            "PRIMARY", "主设备",
+            "STANDBY", "备用设备");
+
+    /** 心跳推导状态（不入库）：在线 / 波动 / 离线；隔离是设备标记，优先于心跳状态 */
+    private static final Map<String, String> DEVICE_STATUS = Map.of(
+            "ONLINE", "在线",
+            "FLAPPING", "波动",
+            "OFFLINE", "离线",
+            "ISOLATED", "已隔离",
+            "UNBOUND", "未关联本场");
+
+    /** 圈速事件阶段：已入账 / 待对账 / 隔离区 / 已丢弃 */
+    private static final Map<String, String> LAP_EVENT_STAGE = Map.of(
+            "ACCEPTED", "已入账",
+            "PENDING", "待对账",
+            "QUARANTINED", "隔离区",
+            "DISCARDED", "已丢弃");
+
+    /** 进隔离区的原因：旧主边界后 / 备用边界前 / 圈速越界 */
+    private static final Map<String, String> QUARANTINE_REASON = Map.of(
+            "OLD_AFTER_BOUNDARY", "旧主边界后事件",
+            "BACKUP_BEFORE_BOUNDARY", "备用边界前事件",
+            "BAD_LAP_TIME", "圈速超出合理区间");
+
+    /** 设备告警类型 */
+    private static final Map<String, String> DEVICE_ALERT_TYPE = Map.of(
+            "OFFLINE", "离线",
+            "FLAPPING", "心跳波动",
+            "GAP", "序号缺口",
+            "TAKEOVER_REQ", "接管请求",
+            "QUARANTINED", "设备隔离");
+
+    /** 告警状态 */
+    private static final Map<String, String> DEVICE_ALERT_STATUS = Map.of(
+            "ACTIVE", "未确认",
+            "ACKED", "已确认",
+            "RESOLVED", "已自动消除");
+
+    /** 接管记录状态 */
+    private static final Map<String, String> TAKEOVER_STATUS = Map.of(
+            "REQUESTED", "待主管执行",
+            "DONE", "已完成",
+            "REJECTED", "已驳回",
+            "CANCELED", "已撤销");
+
+    /** 序号缺口状态 */
+    private static final Map<String, String> GAP_STATUS = Map.of(
+            "OPEN", "缺口中",
+            "FILLED", "已补齐");
+
+    /** 心跳节奏：正常间隔约 3 秒 */
+    public static final long HEARTBEAT_INTERVAL_MS = 3000;
+    /** 最近一次心跳间隔超过该值视为节奏波动（如 4 个周期才报到） */
+    public static final long HEARTBEAT_FLAP_GAP_MS = 10000;
+    /** 最后心跳年龄阈值：≤10s 在线，10~30s 波动，>30s 离线 */
+    public static final long HEARTBEAT_ONLINE_AGE_MS = 10000;
+    public static final long HEARTBEAT_OFFLINE_AGE_MS = 30000;
+
     // ---------------- 圈速 ----------------
     private static final Map<String, String> LAP_VALID = Map.of(
             "VALID", "有效",
@@ -272,6 +332,68 @@ public final class TrackDict {
 
     public static String maintStatusName(String status) {
         return status == null ? "" : MAINT_STATUS.getOrDefault(status, status);
+    }
+
+    // ---------------- 计时设备取值方法 ----------------
+
+    public static boolean isValidDeviceRole(String role) {
+        return role != null && DEVICE_ROLE.containsKey(role);
+    }
+
+    public static String deviceRoleName(String role) {
+        return role == null ? "" : DEVICE_ROLE.getOrDefault(role, role);
+    }
+
+    public static String deviceStatusName(String status) {
+        return status == null ? "" : DEVICE_STATUS.getOrDefault(status, status);
+    }
+
+    public static boolean isValidLapEventStage(String stage) {
+        return stage != null && LAP_EVENT_STAGE.containsKey(stage);
+    }
+
+    public static String lapEventStageName(String stage) {
+        return stage == null ? "" : LAP_EVENT_STAGE.getOrDefault(stage, stage);
+    }
+
+    public static String quarantineReasonName(String reason) {
+        return reason == null ? "" : QUARANTINE_REASON.getOrDefault(reason, reason);
+    }
+
+    public static boolean isValidQuarantineReason(String reason) {
+        return reason != null && QUARANTINE_REASON.containsKey(reason);
+    }
+
+    public static String deviceAlertTypeName(String type) {
+        return type == null ? "" : DEVICE_ALERT_TYPE.getOrDefault(type, type);
+    }
+
+    public static String deviceAlertStatusName(String status) {
+        return status == null ? "" : DEVICE_ALERT_STATUS.getOrDefault(status, status);
+    }
+
+    public static String takeoverStatusName(String status) {
+        return status == null ? "" : TAKEOVER_STATUS.getOrDefault(status, status);
+    }
+
+    public static String gapStatusName(String status) {
+        return status == null ? "" : GAP_STATUS.getOrDefault(status, status);
+    }
+
+    /**
+     * 按最后心跳年龄与最近间隔推导设备心跳状态（不含隔离，隔离由调用方优先处理）。
+     *
+     * @param ageMs   距最后一次心跳的毫秒数（从未心跳传 Long.MAX_VALUE）
+     * @param gapMs   最近两次心跳间隔（毫秒），可空
+     */
+    public static String deriveDeviceStatus(long ageMs, Long gapMs) {
+        if (ageMs > HEARTBEAT_OFFLINE_AGE_MS) {
+            return "OFFLINE";
+        }
+        if (ageMs > HEARTBEAT_ONLINE_AGE_MS || (gapMs != null && gapMs > HEARTBEAT_FLAP_GAP_MS)) {
+            return "FLAPPING";
+        }
+        return "ONLINE";
     }
 
     /** 毫秒 → mm:ss.mmm；空值返回 --:--.--- */

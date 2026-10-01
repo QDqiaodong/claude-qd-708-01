@@ -51,6 +51,16 @@ public class GlobalExceptionHandler {
     }
 
     /**
+     * 乐观锁冲突：400（过期页面/重复操作拿到旧版本，不能覆盖设备的新状态）
+     */
+    @org.springframework.web.bind.annotation.ExceptionHandler(
+            org.springframework.orm.ObjectOptimisticLockingFailureException.class)
+    public ResponseEntity<ApiResponse<Void>> handleStale(org.springframework.orm.ObjectOptimisticLockingFailureException e) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.fail("设备状态已被其他操作更新（页面可能已过期），请刷新后重试，本次写入未生效"));
+    }
+
+    /**
      * 唯一约束冲突：400（避免在页面上抛出非人话的外键报错）
      */
     @ExceptionHandler(DataIntegrityViolationException.class)

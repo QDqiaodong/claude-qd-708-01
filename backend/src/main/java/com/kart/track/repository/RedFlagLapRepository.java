@@ -22,4 +22,6 @@ public interface RedFlagLapRepository extends JpaRepository<RedFlagLap, Long> {
     long countBySessionIdAndRuling(Long sessionId, String ruling);
 
     long countByRuling(String ruling);
+
+    boolean existsByLapIdAndRuling(Long lapId, String ruling);
 }

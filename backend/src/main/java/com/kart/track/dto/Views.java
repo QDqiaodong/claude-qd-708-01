@@ -176,7 +176,10 @@ public final class Views {
             long maintDone,
             BigDecimal maintFee,
             long redFlagActive,
-            long redFlagPendingLaps) {
+            long redFlagPendingLaps,
+            long timingAlertActive,
+            long timingQuarantined,
+            long timingPendingEvents) {
     }
 
     /** 红旗车辆核查清单一行（含车辆/车手快照名与最新状态） */
@@ -269,5 +272,221 @@ public final class Views {
             boolean redFlagActive,
             RedFlagEventView activeEvent,
             List<RedFlagEventView> history) {
+    }
+
+    // ============================================================ 模块九：计时设备韧性台
+
+    /** 设备心跳流水一行 */
+    public record TimingHeartbeatView(
+            Long id,
+            Long deviceId,
+            Long hbSeq,
+            LocalDateTime occurredAt,
+            LocalDateTime receivedAt,
+            long gapMs,
+            long ageMs,
+            boolean gapFlap) {
+    }
+
+    /** 设备告警一行 */
+    public record TimingAlertView(
+            Long id,
+            Long deviceId,
+            String deviceCode,
+            String deviceName,
+            Long sessionId,
+            String type,
+            String typeName,
+            String message,
+            String status,
+            String statusName,
+            LocalDateTime raisedAt,
+            String ackedBy,
+            LocalDateTime ackedAt) {
+    }
+
+    /** 韧性台设备卡片：身份/赛道/场次/推导状态/最近序号/缺口/当前来源标记 */
+    public record TimingDeviceView(
+            Long id,
+            String deviceCode,
+            String name,
+            String trackCode,
+            String trackCodeName,
+            String role,
+            String roleName,
+            Long sessionId,
+            String sessionNo,
+            boolean boundToSession,
+            boolean quarantined,
+            String quarantineReason,
+            String quarantinedBy,
+            LocalDateTime quarantinedAt,
+            boolean enabled,
+            String status,
+            String statusName,
+            LocalDateTime lastHeartbeatAt,
+            long lastAgeMs,
+            Long lastHbSeq,
+            Long hbGapMs,
+            long confirmedSeq,
+            Long boundarySeq,
+            Long openGapFrom,
+            Long openGapTo,
+            long pendingCount,
+            boolean currentSource,
+            int version,
+            List<TimingHeartbeatView> recentHeartbeats,
+            List<TimingAlertView> alerts) {
+    }
+
+    /** 序号缺口一行 */
+    public record TimingGapView(
+            Long id,
+            Long deviceId,
+            String deviceCode,
+            String deviceName,
+            long missingFrom,
+            long missingTo,
+            String status,
+            String statusName,
+            LocalDateTime openedAt,
+            LocalDateTime filledAt,
+            int pendingCount) {
+    }
+
+    /** 圈速事件总账一行（设备时间线/待对账/隔离区共用） */
+    public record TimingLapEventView(
+            Long id,
+            String eventUid,
+            Long deviceId,
+            String deviceCode,
+            String deviceName,
+            String sourceRole,
+            String sourceRoleName,
+            Long sessionId,
+            Long driverId,
+            String driverName,
+            Long kartId,
+            String kartNo,
+            long seq,
+            Integer lapTimeMs,
+            String lapTimeText,
+            String valid,
+            String validName,
+            LocalDateTime occurredAt,
+            LocalDateTime receivedAt,
+            String stage,
+            String stageName,
+            Long lapId,
+            Long gapId,
+            String quarantineReason,
+            String quarantineReasonName,
+            String quarantineNote,
+            String decidedBy,
+            LocalDateTime decidedAt,
+            boolean redFlagHeld) {
+    }
+
+    /** 主备接管记录一行 */
+    public record TimingTakeoverView(
+            Long id,
+            String takeoverNo,
+            Long sessionId,
+            String sessionNo,
+            Long oldDeviceId,
+            String oldDeviceCode,
+            String oldDeviceName,
+            Long newDeviceId,
+            String newDeviceCode,
+            String newDeviceName,
+            Long boundarySeq,
+            LocalDateTime boundaryAt,
+            String status,
+            String statusName,
+            String reason,
+            String requestedBy,
+            LocalDateTime requestedAt,
+            String executedBy,
+            LocalDateTime executedAt,
+            String execNote,
+            boolean executable) {
+    }
+
+    /** 场次当前数据来源 */
+    public record TimingSourceView(
+            Long deviceId,
+            String deviceCode,
+            String deviceName,
+            String role,
+            String roleName,
+            Long takeoverId,
+            LocalDateTime switchedAt) {
+    }
+
+    /** 设备时间线一个节点（心跳/事件/接管混排，按时刻回看一场比赛的来源变化） */
+    public record TimingTimelineItem(
+            String kind,
+            String kindName,
+            LocalDateTime at,
+            Long deviceId,
+            String deviceCode,
+            String title,
+            String detail,
+            String tone) {
+    }
+
+    /** 圈速事件上报结果：明确告知设备这条事件的去向（重放返回同一结果） */
+    public record LapIngestResult(
+            String eventUid,
+            Long deviceId,
+            String deviceCode,
+            Long sessionId,
+            String stage,
+            String stageName,
+            String result,
+            String resultText,
+            long seq,
+            long confirmedSeq,
+            Long lapId,
+            boolean duplicate,
+            Long gapId,
+            String quarantineReason,
+            String quarantineReasonName,
+            List<TimingLapEventView> advanced) {
+    }
+
+    /** 心跳上报结果 */
+    public record HeartbeatResult(
+            Long deviceId,
+            String deviceCode,
+            Long hbSeq,
+            boolean duplicate,
+            String status,
+            String statusName,
+            boolean accepted,
+            String message) {
+    }
+
+    /** 韧性台一屏：场次 + 当前来源 + 待执行接管 + 设备/缺口/待对账/隔离/接管/告警/时间线 */
+    public record TimingConsoleView(
+            Long sessionId,
+            String sessionNo,
+            String sessionStatus,
+            String sessionStatusName,
+            String trackCode,
+            String trackCodeName,
+            TimingSourceView currentSource,
+            TimingTakeoverView pendingTakeover,
+            List<TimingDeviceView> devices,
+            List<TimingGapView> gaps,
+            List<TimingLapEventView> pendingEvents,
+            List<TimingLapEventView> quarantinedEvents,
+            List<TimingTakeoverView> takeovers,
+            List<TimingAlertView> alerts,
+            List<TimingTimelineItem> timeline,
+            long acceptedCount,
+            long pendingCount,
+            long quarantinedCount,
+            long openGapCount) {
     }
 }

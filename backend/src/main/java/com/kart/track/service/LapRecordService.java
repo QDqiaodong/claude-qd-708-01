@@ -46,6 +46,7 @@ public class LapRecordService {
     private final RedFlagEventRepository redFlagEventRepository;
     private final RedFlagLapRepository redFlagLapRepository;
     private final RedFlagCheckRepository redFlagCheckRepository;
+    private final LapBookingService lapBookingService;
 
     public LapRecordService(LapRecordRepository lapRecordRepository,
                             RaceSessionRepository sessionRepository,
@@ -53,7 +54,8 @@ public class LapRecordService {
                             KartRepository kartRepository,
                             RedFlagEventRepository redFlagEventRepository,
                             RedFlagLapRepository redFlagLapRepository,
-                            RedFlagCheckRepository redFlagCheckRepository) {
+                            RedFlagCheckRepository redFlagCheckRepository,
+                            LapBookingService lapBookingService) {
         this.lapRecordRepository = lapRecordRepository;
         this.sessionRepository = sessionRepository;
         this.driverRepository = driverRepository;
@@ -61,6 +63,7 @@ public class LapRecordService {
         this.redFlagEventRepository = redFlagEventRepository;
         this.redFlagLapRepository = redFlagLapRepository;
         this.redFlagCheckRepository = redFlagCheckRepository;
+        this.lapBookingService = lapBookingService;
     }
 
     @Transactional(readOnly = true)
@@ -163,61 +166,10 @@ public class LapRecordService {
             throw new BizException("圈速判定只能是 有效/无效-出界/无效-碰撞");
         }
 
-        int lapIndex = (int) lapRecordRepository.findByDriverIdOrderByLapTimeMsAsc(driver.getId()).stream()
-                .filter(lap -> lap.getSessionId().equals(session.getId()))
-                .count() + 1;
-
-        LapRecord lap = new LapRecord();
-        lap.setSessionId(session.getId());
-        lap.setDriverId(driver.getId());
-        lap.setKartId(kart.getId());
-        lap.setLapIndex(lapIndex);
-        lap.setLapTimeMs(ms);
-        lap.setValid(valid);
-        lap.setCreatedAt(LocalDateTime.now());
-
-        boolean fastest = false;
-        if (!underRedFlag && "VALID".equals(valid)) {
-            Integer currentBest = null;
-            for (LapRecord old : lapRecordRepository.findBySessionIdAndValidOrderByLapTimeMsAsc(session.getId(), "VALID")) {
-                currentBest = old.getLapTimeMs();
-                break;
-            }
-            fastest = currentBest == null || ms < currentBest;
-            if (fastest && currentBest != null) {
-                // 旧最快圈复位：走 @SQLUpdate 手写 update
-                for (LapRecord old : lapRecordRepository.findBySessionIdOrderByCreatedAtDesc(session.getId())) {
-                    if (old.isFastest()) {
-                        old.setFastest(false);
-                        lapRecordRepository.save(old);
-                    }
-                }
-            }
-        }
-        lap.setFastest(fastest);
-
-        // ↓↓↓ 真正落库的一句：Hibernate 用 @SQLInsert 里手写好的 insert，不再自己生成
-        LapRecord saved = lapRecordRepository.save(lap);
-
-        if (underRedFlag) {
-            // 红旗期间：隔离为待裁定，不刷最快圈、不刷车手历史最好、不计里程
-            RedFlagLap pending = new RedFlagLap();
-            pending.setLapId(saved.getId());
-            pending.setEventId(activeRedFlag.getId());
-            pending.setSessionId(session.getId());
-            pending.setRuling("PENDING");
-            redFlagLapRepository.save(pending);
-        } else if ("VALID".equals(valid)) {
-            if (driver.getBestLapMs() == null || driver.getBestLapMs() <= 0 || ms < driver.getBestLapMs()) {
-                driver.setBestLapMs(ms);
-                driverRepository.save(driver);
-            }
-            BigDecimal km = TrackDict.configLapKm(session.getTrackConfig());
-            kart.setTotalKm(kart.getTotalKm().add(km));
-            kart.setTotalHours(kart.getTotalHours().add(BigDecimal.valueOf(ms / 3600000.0)));
-            kart.setUpdatedAt(LocalDateTime.now());
-            kartRepository.save(kart);
-        }
+        // ↓↓↓ 真正落账：正常时段写最快圈/刷最佳/计里程；红旗期间挂 red_flag_lap 待主管裁定
+        LapBookingService.BookedLap booked = lapBookingService.book(
+                session, driver, kart, ms, valid, LocalDateTime.now(), activeRedFlag);
+        LapRecord saved = booked.lap();
         return list(session.getId()).stream()
                 .filter(v -> v.id().equals(saved.getId()))
                 .findFirst()

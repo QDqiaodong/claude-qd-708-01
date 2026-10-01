@@ -23,6 +23,9 @@
         <div v-if="(overview.redFlagActive || 0) > 0" class="stat-chip is-redflag" @click="goRedFlag" style="cursor: pointer">
           <b>🚩 {{ overview.redFlagActive || 0 }}</b><span>红旗处理中 · 待裁定 {{ overview.redFlagPendingLaps || 0 }}</span>
         </div>
+        <div v-if="(overview.timingAlertActive || 0) > 0" class="stat-chip is-alert" @click="goResilience" style="cursor: pointer">
+          <b>📡 {{ overview.timingAlertActive || 0 }}</b><span>计时设备告警</span>
+        </div>
         <div class="stat-chip"><b>{{ overview.kartAvailable || 0 }}/{{ overview.kartTotal || 0 }}</b><span>可用车辆</span></div>
         <div class="stat-chip"><b>{{ overview.driverTotal || 0 }}</b><span>注册车手</span></div>
         <div class="stat-chip"><b>{{ overview.sessionRunning || 0 }}</b><span>进行中场次</span></div>
@@ -120,6 +123,10 @@ function go(path) {
 
 function goRedFlag() {
   nav.push('/red-flag')
+}
+
+function goResilience() {
+  nav.push('/resilience')
 }
 
 function onPickSession(id) {

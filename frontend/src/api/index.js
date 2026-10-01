@@ -105,3 +105,23 @@ export const redFlagApi = {
   resume: (eventId) => http.post(`/red-flags/events/${eventId}/resume`),
   terminate: (eventId) => http.post(`/red-flags/events/${eventId}/terminate`)
 }
+
+/** 模块九：计时设备韧性台（心跳 / 圈速事件 / 缺口补偿 / 主备接管 / 隔离区） */
+export const resilienceApi = {
+  console: (sessionId) => http.get('/resilience/console', { params: sessionId ? { sessionId } : {} }),
+  devices: (trackCode) => http.get('/resilience/devices', { params: trackCode ? { trackCode } : {} }),
+  device: (id) => http.get(`/resilience/devices/${id}`),
+  register: (params) => http.post('/resilience/devices', null, { params }),
+  bind: (id, data) => http.post(`/resilience/devices/${id}/bind`, data),
+  quarantine: (id, reason) => http.post(`/resilience/devices/${id}/quarantine`, { reason }),
+  release: (id) => http.post(`/resilience/devices/${id}/release`),
+  heartbeat: (data) => http.post('/resilience/devices/heartbeat', data),
+  ingestLap: (data) => http.post('/resilience/lap-events', data),
+  requestTakeover: (sessionId, data) => http.post(`/resilience/sessions/${sessionId}/takeover-requests`, data),
+  executeTakeover: (id) => http.post(`/resilience/takeovers/${id}/execute`),
+  rejectTakeover: (id, note) => http.post(`/resilience/takeovers/${id}/reject`, { note }),
+  cancelTakeover: (id) => http.post(`/resilience/takeovers/${id}/cancel`),
+  ackAlert: (id) => http.post(`/resilience/alerts/${id}/ack`),
+  discardQuarantined: (id, note) => http.post(`/resilience/quarantine-events/${id}/discard`, { note }),
+  resegmentQuarantined: (id, note) => http.post(`/resilience/quarantine-events/${id}/resegment`, { note })
+}

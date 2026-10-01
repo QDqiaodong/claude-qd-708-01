@@ -36,6 +36,7 @@
             <el-button v-if="row.status === 'PENDING'" link type="danger" @click="act(row, 'cancel')">取消</el-button>
             <el-button v-if="row.redFlagActive" link type="danger" @click="openConsole(row)">🚩 红旗处置台</el-button>
             <el-button v-if="row.redFlagCount" link @click="openConsole(row)">红旗记录 {{ row.redFlagCount }}</el-button>
+            <el-button link type="primary" @click="openResilience(row)">📡 计时来源/时间线</el-button>
             <el-button link @click="focus(row)">设为本场</el-button>
           </template>
         </el-table-column>
@@ -131,6 +132,13 @@ function focus(row) {
 function openConsole(row) {
   track.sessionId.value = row.id
   nav.push('/red-flag')
+}
+
+/** 从场次详情回看该场比赛内完整的计时来源变化（心跳/缺口/接管边界/事件时间线） */
+function openResilience(row) {
+  track.sessionId.value = row.id
+  localStorage.setItem('kart-session-id', String(row.id))
+  nav.push('/resilience')
 }
 
 watch(() => track.sessionId.value, () => load())

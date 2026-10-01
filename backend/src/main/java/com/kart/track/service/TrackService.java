@@ -30,6 +30,9 @@ import com.kart.track.repository.MaintenanceRepository;
 import com.kart.track.repository.RaceSessionRepository;
 import com.kart.track.repository.RedFlagEventRepository;
 import com.kart.track.repository.RedFlagLapRepository;
+import com.kart.track.repository.TimingAlertRepository;
+import com.kart.track.repository.TimingDeviceRepository;
+import com.kart.track.repository.TimingLapEventRepository;
 
 /** 首页「赛道实况」：大计时器 + 场次信息条 + 赛道点位 + 实时圈速排行榜。 */
 @Service
@@ -42,6 +45,9 @@ public class TrackService {
     private final MaintenanceRepository maintenanceRepository;
     private final RedFlagLapRepository redFlagLapRepository;
     private final RedFlagEventRepository redFlagEventRepository;
+    private final TimingAlertRepository timingAlertRepository;
+    private final TimingDeviceRepository timingDeviceRepository;
+    private final TimingLapEventRepository timingLapEventRepository;
 
     public TrackService(RaceSessionRepository sessionRepository,
                         LapRecordRepository lapRecordRepository,
@@ -49,7 +55,10 @@ public class TrackService {
                         KartRepository kartRepository,
                         MaintenanceRepository maintenanceRepository,
                         RedFlagLapRepository redFlagLapRepository,
-                        RedFlagEventRepository redFlagEventRepository) {
+                        RedFlagEventRepository redFlagEventRepository,
+                        TimingAlertRepository timingAlertRepository,
+                        TimingDeviceRepository timingDeviceRepository,
+                        TimingLapEventRepository timingLapEventRepository) {
         this.sessionRepository = sessionRepository;
         this.lapRecordRepository = lapRecordRepository;
         this.driverRepository = driverRepository;
@@ -57,6 +66,9 @@ public class TrackService {
         this.maintenanceRepository = maintenanceRepository;
         this.redFlagLapRepository = redFlagLapRepository;
         this.redFlagEventRepository = redFlagEventRepository;
+        this.timingAlertRepository = timingAlertRepository;
+        this.timingDeviceRepository = timingDeviceRepository;
+        this.timingLapEventRepository = timingLapEventRepository;
     }
 
     /** 顶栏计数器 */
@@ -92,7 +104,10 @@ public class TrackService {
                 maintDone,
                 fee,
                 redFlagActive,
-                pendingLaps);
+                pendingLaps,
+                timingAlertRepository.countByStatus("ACTIVE"),
+                timingDeviceRepository.countByQuarantinedTrue(),
+                timingLapEventRepository.countByStage("PENDING"));
     }
 
     /**

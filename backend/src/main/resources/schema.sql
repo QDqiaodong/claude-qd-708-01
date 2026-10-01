@@ -2,7 +2,7 @@
 -- 卡丁车赛道运营管理系统 · 建表 + 种子数据
 -- 库名 kart_track，由 mysql 镜像的 docker-entrypoint 在【镜像构建期】执行一次。
 --
--- 八个业务模块：
+-- 业务模块（原有 8 个 + 新增计时设备韧性台 5 张相关表组）：
 --   1. kart         卡丁车（车号·车型·排量·功率·状态·累计里程/小时·保养间隔）
 --   2. driver       车手（会员号·年龄分组·驾照等级·累计场次·历史最快圈速）
 --   3. race_session 场次（赛道配置·分组·最大车辆数·已报名人数·状态）
@@ -11,6 +11,11 @@
 --   6. red_flag_event 红旗事件（原因·发生时刻·生效中/已恢复/已终止；同场次同时只允许一个生效中）
 --   7. red_flag_check 红旗车辆核查（可继续 / 退出比赛 / 需要维修，每车一条、互不影响）
 --   8. red_flag_lap   红旗期间圈速隔离（1:1 挂 lap_record：待主管裁定 / 已确认有效 / 已作废）
+--   9. timing_device  计时设备身份（稳定设备码·所属赛道·主/备·当前场次·隔离标记·乐观锁版本）
+--  10. timing_device_session 设备×场次序号水位（confirmed_seq 是断线补偿的确认进度点）
+--  11. timing_heartbeat / timing_alert 心跳流水与设备告警（在线/波动/离线/隔离由心跳年龄推导）
+--  12. timing_lap_event / timing_gap 圈速事件总账与序号缺口（去重·待对账·隔离留证）
+--  13. timing_takeover / timing_source 主备接管记录与场次当前数据来源（边界时刻+边界序号）
 --
 -- 种子数据保证下面每条业务规则都能被真的触发（不是"理论上可以"）：
 --   [R1.1] 车号唯一            → K-01 已存在
@@ -36,6 +41,14 @@ SET FOREIGN_KEY_CHECKS = 0;
 CREATE DATABASE IF NOT EXISTS kart_track DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE kart_track;
 
+DROP TABLE IF EXISTS timing_alert;
+DROP TABLE IF EXISTS timing_heartbeat;
+DROP TABLE IF EXISTS timing_gap;
+DROP TABLE IF EXISTS timing_lap_event;
+DROP TABLE IF EXISTS timing_takeover;
+DROP TABLE IF EXISTS timing_source;
+DROP TABLE IF EXISTS timing_device_session;
+DROP TABLE IF EXISTS timing_device;
 DROP TABLE IF EXISTS red_flag_lap;
 DROP TABLE IF EXISTS red_flag_check;
 DROP TABLE IF EXISTS red_flag_event;
@@ -219,6 +232,212 @@ CREATE TABLE red_flag_lap (
     KEY idx_redflag_lap_session_ruling (session_id, ruling)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '红旗期间圈速隔离裁定';
 
+-- ----------------------------------------------------------------------------
+-- 模块九：计时设备身份
+--
+-- 设备码 device_code 是设备侧烧录的稳定身份（重放/接管都认它，不认自增 id）。
+-- 每台设备明确绑定一条物理赛道（track_code：HALF/FULL/NIGHT），session_id 是它
+-- 当前服务的场次（可为空 = 未关联本场）。role PRIMARY/STANDBY 区分主设备与备用设备。
+--
+-- 隔离 quarantined=1 由主管设置/解除：隔离设备仍接收心跳留痕，但圈速上报一律拒绝，
+-- 绝不混入本场成绩。version 是 JPA 乐观锁版本：过期页面/重复操作无法覆盖新状态。
+-- ----------------------------------------------------------------------------
+CREATE TABLE timing_device (
+    id              BIGINT      NOT NULL AUTO_INCREMENT,
+    device_code     VARCHAR(40) NOT NULL COMMENT '设备侧稳定身份码（烧录，不随场次变化）',
+    name            VARCHAR(40) NOT NULL COMMENT '设备名称',
+    track_code      VARCHAR(16) NOT NULL COMMENT '所属物理赛道：HALF/FULL/NIGHT',
+    role            VARCHAR(16) NOT NULL COMMENT 'PRIMARY 主设备 / STANDBY 备用设备',
+    session_id      BIGINT      NULL COMMENT '当前关联场次（NULL=未关联本场）',
+    last_heartbeat_at DATETIME  NULL COMMENT '最后一次心跳时刻',
+    last_hb_seq     BIGINT      NULL COMMENT '最近一次心跳序号（设备侧心跳自增号）',
+    hb_gap_ms       BIGINT      NULL COMMENT '最近两次心跳间隔（毫秒），用于波动判定',
+    quarantined     TINYINT(1)  NOT NULL DEFAULT 0 COMMENT '是否被主管隔离：1 时圈速上报一律拒绝',
+    quarantine_reason VARCHAR(200) NULL COMMENT '隔离原因',
+    quarantined_by  VARCHAR(60) NULL COMMENT '隔离操作人（主管）',
+    quarantined_at  DATETIME    NULL COMMENT '隔离时刻',
+    enabled         TINYINT(1)  NOT NULL DEFAULT 1 COMMENT '是否在用（停用设备不参与接管）',
+    version         INT         NOT NULL DEFAULT 0 COMMENT '乐观锁版本（@Version）',
+    created_at      DATETIME    NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_timing_device_code (device_code),
+    KEY idx_timing_device_track (track_code),
+    KEY idx_timing_device_session (session_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '计时设备';
+
+-- ----------------------------------------------------------------------------
+-- 模块十：设备 × 场次 序号水位
+--
+-- confirmed_seq 是「已经确认进入正常计圈链」的最大圈速序号——断线补偿的检查点。
+-- 设备重连批量重放时，系统只从 confirmed_seq+1 继续处理；补偿中途再次中断，
+-- 已确认的进度不会回退、已落账事件不会重复处理（timing_lap_event 的 uk 再兜底去重）。
+-- 接管发生时为主设备/备用设备各开一行，边界序号 boundary_seq 明确「谁负责哪一段」。
+-- ----------------------------------------------------------------------------
+CREATE TABLE timing_device_session (
+    id              BIGINT      NOT NULL AUTO_INCREMENT,
+    device_id       BIGINT      NOT NULL COMMENT '设备',
+    session_id      BIGINT      NOT NULL COMMENT '场次',
+    confirmed_seq   BIGINT      NOT NULL DEFAULT 0 COMMENT '已确认入账的最大圈速序号（补偿检查点）',
+    boundary_seq    BIGINT      NULL COMMENT '接管边界序号：仅该边界之前/之后认本设备（以发生时刻为准）',
+    bound_at        DATETIME    NOT NULL COMMENT '绑定/接管进入本场的时刻',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_tds_device_session (device_id, session_id),
+    KEY idx_tds_session (session_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '设备×场次序号水位';
+
+-- ----------------------------------------------------------------------------
+-- 模块十一（心跳）：心跳流水
+--
+-- 在线/波动/离线不入库、在读取时按「最后心跳年龄 + 最近间隔」推导：
+--   在线 ONLINE（≤10s 且节奏稳定）/ 波动 FLAPPING（最近间隔 >10s，或年龄 10~30s）/
+--   离线 OFFLINE（超过 30s 无心跳）；设备被隔离时直接显示 ISOLATED。
+-- ----------------------------------------------------------------------------
+CREATE TABLE timing_heartbeat (
+    id              BIGINT      NOT NULL AUTO_INCREMENT,
+    device_id       BIGINT      NOT NULL COMMENT '设备',
+    session_id      BIGINT      NULL COMMENT '上报时设备关联的场次（快照）',
+    hb_seq          BIGINT      NOT NULL COMMENT '心跳序号（设备侧自增，重复号不更新水位）',
+    occurred_at     DATETIME    NOT NULL COMMENT '心跳实际产生时刻（设备侧）',
+    received_at     DATETIME    NOT NULL COMMENT '服务端收到时刻',
+    gap_ms          BIGINT      NOT NULL DEFAULT 0 COMMENT '与上一心跳的间隔（毫秒），首条为 0',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_hb_device_seq (device_id, hb_seq),
+    KEY idx_hb_device_time (device_id, occurred_at)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '计时设备心跳流水';
+
+-- ----------------------------------------------------------------------------
+-- 模块十一（告警）：设备告警（值班人员可确认，确认即冻结不复活）
+-- ----------------------------------------------------------------------------
+CREATE TABLE timing_alert (
+    id              BIGINT      NOT NULL AUTO_INCREMENT,
+    device_id       BIGINT      NOT NULL COMMENT '设备',
+    session_id      BIGINT      NULL COMMENT '产生时关联场次（快照）',
+    type            VARCHAR(24) NOT NULL COMMENT 'OFFLINE 离线 / FLAPPING 心跳波动 / GAP 序号缺口 / TAKEOVER_REQ 接管请求 / QUARANTINED 隔离',
+    message         VARCHAR(200) NOT NULL COMMENT '告警内容',
+    status          VARCHAR(16)  NOT NULL COMMENT 'ACTIVE 未确认 / ACKED 已确认 / RESOLVED 已自动消除',
+    raised_at       DATETIME     NOT NULL COMMENT '产生时刻',
+    acked_by        VARCHAR(60)  NULL COMMENT '确认人（值班人员/主管）',
+    acked_at        DATETIME     NULL COMMENT '确认时刻',
+    dedup_key       VARCHAR(120) NOT NULL COMMENT '同设备同类型只允许一条 ACTIVE 的去重键',
+    active_key      VARCHAR(120) GENERATED ALWAYS AS (CASE WHEN status = 'ACTIVE' THEN dedup_key ELSE NULL END) STORED COMMENT '仅 ACTIVE 行存去重键（唯一索引允许多个 NULL）',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_alert_active (active_key),
+    KEY idx_alert_device (device_id),
+    KEY idx_alert_status (status)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '计时设备告警';
+
+-- ----------------------------------------------------------------------------
+-- 模块十二：圈速事件总账（设备上报一条事件 = 这里一行，重放幂等）
+--
+-- event_uid 是设备侧唯一标识（设备内全局唯一）：uk_device_uid 保证同一事件无论
+-- 重放多少次，只产生一条事件、至多一条 lap_record（lap_id 1:1 回链）。
+-- seq 是本场内设备侧递增圈速序号；source_role 记录事件来自主设备还是备用设备。
+--
+-- stage 状态机：
+--   ACCEPTED  已确认进入正常计圈链（序号连续 + 来源有效，已落 lap_record）
+--   PENDING   待对账（发现序号缺口，缺口之后先保留，绝不进排行榜/历史最好）
+--   QUARANTINED 隔离区（来源不匹配接管边界等，主管查明后 DISCARD/RESEGMENT）
+--   DISCARDED 主管丢弃，仅留底
+-- 红旗期间被 ACCEPTED 的事件同时挂 red_flag_lap 待主管裁定，不写最快圈/最佳。
+-- ----------------------------------------------------------------------------
+CREATE TABLE timing_lap_event (
+    id              BIGINT      NOT NULL AUTO_INCREMENT,
+    event_uid       VARCHAR(60) NOT NULL COMMENT '设备侧事件唯一标识（重放幂等键）',
+    device_id       BIGINT      NOT NULL COMMENT '上报设备',
+    session_id      BIGINT      NOT NULL COMMENT '所属场次',
+    driver_id       BIGINT      NOT NULL COMMENT '车手（设备检测）',
+    kart_id         BIGINT      NOT NULL COMMENT '车辆（设备检测）',
+    seq             BIGINT      NOT NULL COMMENT '本场内设备侧递增圈速序号',
+    lap_time_ms     INT         NOT NULL COMMENT '圈速（毫秒）',
+    valid           VARCHAR(16) NOT NULL COMMENT 'VALID/OUT/CRASH（设备判定）',
+    occurred_at     DATETIME    NOT NULL COMMENT '圈速实际产生时刻（设备侧）',
+    received_at     DATETIME    NOT NULL COMMENT '服务端收到时刻（重放时远晚于产生时刻）',
+    source_role     VARCHAR(16) NOT NULL COMMENT '上报时设备角色 PRIMARY/STANDBY',
+    stage           VARCHAR(16) NOT NULL COMMENT 'ACCEPTED/PENDING/QUARANTINED/DISCARDED',
+    lap_id          BIGINT      NULL COMMENT '入账后回链 lap_record.id（1:1，未入账为 NULL）',
+    gap_id          BIGINT      NULL COMMENT '归属的序号缺口（待对账期间）',
+    quarantine_reason VARCHAR(32) NULL COMMENT '隔离原因码：OLD_AFTER_BOUNDARY 旧主边界后 / BACKUP_BEFORE_BOUNDARY 备用边界前 / BAD_LAP_TIME 圈速越界',
+    quarantine_note   VARCHAR(200) NULL COMMENT '隔离说明',
+    decided_by      VARCHAR(60) NULL COMMENT '隔离区处置主管',
+    decided_at      DATETIME    NULL COMMENT '隔离区处置时刻',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_tle_device_uid (device_id, event_uid),
+    UNIQUE KEY uk_tle_device_session_seq (device_id, session_id, seq),
+    KEY idx_tle_session_stage (session_id, stage),
+    KEY idx_tle_device_session (device_id, session_id),
+    KEY idx_tle_lap (lap_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '计时设备圈速事件总账';
+
+-- ----------------------------------------------------------------------------
+-- 模块十二：序号缺口
+--
+-- 收到 seq > confirmed_seq+1 时开窗（OPEN），missing_from/missing_to 为缺失区间；
+-- 重放按序补齐后关窗（FILLED）。一条缺口挂住其后所有 PENDING 事件，关窗时才放行。
+-- ----------------------------------------------------------------------------
+CREATE TABLE timing_gap (
+    id              BIGINT      NOT NULL AUTO_INCREMENT,
+    device_id       BIGINT      NOT NULL COMMENT '设备',
+    session_id      BIGINT      NOT NULL COMMENT '场次',
+    missing_from    BIGINT      NOT NULL COMMENT '缺失起始序号',
+    missing_to      BIGINT      NOT NULL COMMENT '缺失结束序号（随更大缺口更新）',
+    status          VARCHAR(16)  NOT NULL COMMENT 'OPEN 缺口未补齐 / FILLED 已按序补齐',
+    opened_at       DATETIME     NOT NULL COMMENT '发现缺口时刻',
+    filled_at       DATETIME     NULL COMMENT '补齐关窗时刻',
+    pending_count   INT          NOT NULL DEFAULT 0 COMMENT '挂在该缺口上的待对账事件数',
+    PRIMARY KEY (id),
+    KEY idx_gap_device_session (device_id, session_id),
+    KEY idx_gap_status (status)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '计时圈速序号缺口';
+
+-- ----------------------------------------------------------------------------
+-- 模块十三：主备接管记录
+--
+-- 边界 = boundary_at（接管生效时刻）+ boundary_seq（旧主最后负责的圈速序号）：
+--   边界之前只认主设备，边界之后只认备用设备。旧主晚到的「边界后」事件、备用提前
+--   产生的「边界前」事件一律进隔离区（timing_lap_event.stage=QUARANTINED）。
+-- REQUESTED 是值班人员发起的接管请求（待主管执行）；同场次同时只允许一条生效请求。
+-- DONE 的记录与 timing_source 一起在同一事务提交，任何一步失败整体回滚——
+-- 不会出现两台设备同时是当前来源，或接管已记录但排行榜仍沿用旧来源。
+-- ----------------------------------------------------------------------------
+CREATE TABLE timing_takeover (
+    id              BIGINT      NOT NULL AUTO_INCREMENT,
+    takeover_no     VARCHAR(30) NOT NULL COMMENT '接管编号，如 TO20260924S1-1',
+    session_id      BIGINT      NOT NULL COMMENT '场次',
+    old_device_id   BIGINT      NOT NULL COMMENT '原主设备',
+    new_device_id   BIGINT      NOT NULL COMMENT '接管备用设备',
+    boundary_seq    BIGINT      NULL COMMENT '边界序号：旧主负责到该序号（请求时记录）',
+    boundary_at     DATETIME    NULL COMMENT '边界时刻（主管执行时落定）',
+    status          VARCHAR(16) NOT NULL COMMENT 'REQUESTED 待执行 / DONE 已完成 / REJECTED 已驳回 / CANCELED 已撤销',
+    reason          VARCHAR(200) NOT NULL COMMENT '接管原因（请求时必填）',
+    requested_by    VARCHAR(60) NOT NULL COMMENT '请求发起人（值班人员）',
+    requested_at    DATETIME    NOT NULL COMMENT '请求时刻',
+    executed_by     VARCHAR(60) NULL COMMENT '执行/驳回主管',
+    executed_at     DATETIME    NULL COMMENT '执行/驳回时刻',
+    exec_note       VARCHAR(200) NULL COMMENT '驳回原因等',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_takeover_no (takeover_no),
+    KEY idx_takeover_session (session_id),
+    KEY idx_takeover_status (status),
+    KEY idx_takeover_devices (old_device_id, new_device_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '计时设备主备接管';
+
+-- ----------------------------------------------------------------------------
+-- 模块十三：场次当前数据来源（一场至多一行）
+--
+-- 当前来源切换与接管记录在同一事务完成；该行存在即「本场当前认这台设备」，
+-- 事件入账前据此校验来源，防止半完成状态下两台设备的数据都进榜。
+-- ----------------------------------------------------------------------------
+CREATE TABLE timing_source (
+    id              BIGINT      NOT NULL AUTO_INCREMENT,
+    session_id      BIGINT      NOT NULL COMMENT '场次',
+    device_id       BIGINT      NOT NULL COMMENT '当前数据来源设备',
+    takeover_id     BIGINT      NULL COMMENT '最近一次接管（首台主设备绑定时为 NULL）',
+    switched_at     DATETIME    NOT NULL COMMENT '成为当前来源的时刻',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_source_session (session_id),
+    KEY idx_source_device (device_id)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci COMMENT = '场次当前计时数据来源';
+
 
 -- ---------------------------- 卡丁车（12 台） ----------------------------
 INSERT INTO kart (id, kart_no, model, engine_cc, max_power, status, total_km, total_hours,
@@ -316,5 +535,171 @@ INSERT INTO maintenance (id, order_no, kart_id, maint_type, fault_desc, work_hou
     (10, 'MT-20260910', 5,  'BODY',   '前保险杠撞击变形，需钣金修复',          3.00,  420.00,  660.00, NULL,     DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), NULL, 'WAITING'),
     (11, 'MT-20260911', 6,  'BRAKE',  '刹车踏板行程偏长，需排气换片',          2.00,  300.00,  460.00, NULL,     DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), NULL, 'WAITING'),
     (12, 'MT-20260912', 9,  'CHAIN',  '链条异响，待本场结束后进厂',            1.50,  160.00,  280.00, NULL,     DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), NULL, 'WAITING');
+
+-- ---------------------------- 计时设备（8 台：主/备/离线/波动/隔离/历史主备） ----------------------------
+-- 第 1 场 S2026092401（FULL，RUNNING）：TD-FULL-A 主设备在线、TD-FULL-B 备用在线；
+-- TD-FULL-C 波动、TD-FULL-D 离线（演示心跳状态）；TD-FULL-E 被主管隔离（演示隔离）。
+-- 第 3 场（FINISHED）历史主备 TD-OLD-A / TD-OLD-B 各保留一行，接管时间线可回看。
+INSERT INTO timing_device (id, device_code, name, track_code, role, session_id,
+                           last_heartbeat_at, last_hb_seq, hb_gap_ms,
+                           quarantined, quarantine_reason, quarantined_by, quarantined_at,
+                           enabled, version, created_at) VALUES
+    (1, 'TD-FULL-A', '全场主计时门 A', 'FULL', 'PRIMARY', 1,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 3 SECOND),  154,  3000,
+     0, NULL, NULL, NULL, 1, 0, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 20 MINUTE)),
+    (2, 'TD-FULL-B', '全场备用计时门 B', 'FULL', 'STANDBY', 1,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 4 SECOND),  151,  3000,
+     0, NULL, NULL, NULL, 1, 0, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 20 MINUTE)),
+    (3, 'TD-FULL-C', '全场检测点 C（波动）', 'FULL', 'PRIMARY', 1,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 16 SECOND),  88, 14000,
+     0, NULL, NULL, NULL, 1, 0, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 20 MINUTE)),
+    (4, 'TD-FULL-D', '全场检测点 D（离线）', 'FULL', 'PRIMARY', 1,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 6 MINUTE),  203,  3000,
+     0, NULL, NULL, NULL, 1, 0, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 20 MINUTE)),
+    (5, 'TD-FULL-E', '全场检测点 E（隔离）', 'FULL', 'PRIMARY', 1,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 5 SECOND),  132,  3000,
+     1, '上报序号多次跳变，待现场核查', '王主管', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 8 MINUTE),
+     1, 3, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 20 MINUTE)),
+    (6, 'TD-HALF-A', '半场主计时门',     'HALF', 'PRIMARY', NULL, NULL, NULL, NULL,
+     0, NULL, NULL, NULL, 1, 0, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 3 DAY)),
+    (7, 'TD-OLD-A',  '全场旧主计时门（第3场）', 'FULL', 'PRIMARY', NULL,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY),  999, 3000,
+     0, NULL, NULL, NULL, 1, 0, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 2 DAY)),
+    (8, 'TD-OLD-B',  '全场备用门（第3场已接管）', 'FULL', 'STANDBY', NULL,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY),  990, 3000,
+     0, NULL, NULL, NULL, 1, 0, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 2 DAY));
+
+-- 设备×场次水位：第 1 场主设备已确认到 14（与 14 条种子圈速对应），备用尚未接管（边界 NULL）；
+-- 第 3 场旧主边界 2、备用从 3 开始（演示一场比赛内的来源切换）。
+INSERT INTO timing_device_session (id, device_id, session_id, confirmed_seq, boundary_seq, bound_at) VALUES
+    (1, 1, 1, 14, NULL, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 14 MINUTE)),
+    (2, 2, 1,  0, NULL, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 14 MINUTE)),
+    (3, 3, 1,  9, NULL, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 14 MINUTE)),
+    (4, 4, 1, 12, NULL, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 14 MINUTE)),
+    (5, 5, 1, 10, NULL, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 14 MINUTE)),
+    (6, 7, 3,  2, 2,    DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY)),
+    (7, 8, 3,  4, 2,    DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY));
+
+-- 心跳种子：每台设备 3 条；A/B/E 稳定 3s，C 最近一次间隔 14s（波动），D 最后心跳在 6 分钟前（离线）。
+INSERT INTO timing_heartbeat (id, device_id, session_id, hb_seq, occurred_at, received_at, gap_ms) VALUES
+    (1,  1, 1, 152, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 9 SECOND),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 9 SECOND),  3000),
+    (2,  1, 1, 153, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 6 SECOND),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 6 SECOND),  3000),
+    (3,  1, 1, 154, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 3 SECOND),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 3 SECOND),  3000),
+    (4,  2, 1, 149, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 10 SECOND), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 10 SECOND), 3000),
+    (5,  2, 1, 150, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 7 SECOND),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 7 SECOND),  3000),
+    (6,  2, 1, 151, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 4 SECOND),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 4 SECOND),  3000),
+    (7,  3, 1, 86,  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 44 SECOND), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 44 SECOND), 3000),
+    (8,  3, 1, 87,  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 30 SECOND), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 30 SECOND), 14000),
+    (9,  3, 1, 88,  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 16 SECOND), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 16 SECOND), 14000),
+    (10, 4, 1, 201, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 7 MINUTE), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 7 MINUTE), 3000),
+    (11, 4, 1, 202, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 363 SECOND), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 363 SECOND), 3000),
+    (12, 4, 1, 203, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 6 MINUTE), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 6 MINUTE), 3000),
+    (13, 5, 1, 130, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 11 SECOND), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 11 SECOND), 3000),
+    (14, 5, 1, 131, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 8 SECOND),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 8 SECOND),  3000),
+    (15, 5, 1, 132, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 5 SECOND),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 5 SECOND),  3000),
+    (16, 7, 3, 997, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 86406 SECOND), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 86406 SECOND), 3000),
+    (17, 7, 3, 998, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 86403 SECOND), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 86403 SECOND), 3000),
+    (18, 7, 3, 999, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY), 3000),
+    (19, 8, 3, 988, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 86406 SECOND), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 86406 SECOND), 3000),
+    (20, 8, 3, 989, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 86403 SECOND), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 86403 SECOND), 3000),
+    (21, 8, 3, 990, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY), 3000);
+
+-- 当前数据来源：第 1 场认主门 A；第 3 场已切到备用门 B（历史回看）。
+INSERT INTO timing_source (id, session_id, device_id, takeover_id, switched_at) VALUES
+    (1, 1, 1, NULL, DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 14 MINUTE)),
+    (2, 3, 8, 1,    DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY) + INTERVAL 10 MINUTE);
+
+-- 第 3 场一次已完成接管：旧主 TD-OLD-A 负责到边界序号 2，之后认备用 TD-OLD-B。
+INSERT INTO timing_takeover (id, takeover_no, session_id, old_device_id, new_device_id, boundary_seq,
+                             boundary_at, status, reason, requested_by, requested_at,
+                             executed_by, executed_at, exec_note) VALUES
+    (1, 'TO-S3-1', 3, 7, 8, 2,
+     DATE_ADD(DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY), INTERVAL 10 MINUTE),
+     'DONE', '主计时门 A 触发回路故障，读数中断', '张值班',
+     DATE_ADD(DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY), INTERVAL 9 MINUTE),
+     '王主管', DATE_ADD(DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY), INTERVAL 10 MINUTE), NULL);
+
+-- 第 1 场主门 A 的 14 条事件与 14 条种子圈速 1:1（重放/去重/序号链演示的基线）。
+INSERT INTO timing_lap_event (id, event_uid, device_id, session_id, driver_id, kart_id, seq,
+                              lap_time_ms, valid, occurred_at, received_at, source_role,
+                              stage, lap_id, gap_id, quarantine_reason, quarantine_note,
+                              decided_by, decided_at) VALUES
+    (1,  'TD-FULL-A-E001', 1, 1, 1,  2, 1,  44120, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 13 MINUTE), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 13 MINUTE), 'PRIMARY', 'ACCEPTED', 1,  NULL, NULL, NULL, NULL, NULL),
+    (2,  'TD-FULL-A-E002', 1, 1, 2,  3, 2,  43780, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 12 MINUTE), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 12 MINUTE), 'PRIMARY', 'ACCEPTED', 2,  NULL, NULL, NULL, NULL, NULL),
+    (3,  'TD-FULL-A-E003', 1, 1, 3,  4, 3,  45010, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 12 MINUTE), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 12 MINUTE), 'PRIMARY', 'ACCEPTED', 3,  NULL, NULL, NULL, NULL, NULL),
+    (4,  'TD-FULL-A-E004', 1, 1, 8,  4, 4,  46890, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 11 MINUTE), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 11 MINUTE), 'PRIMARY', 'ACCEPTED', 4,  NULL, NULL, NULL, NULL, NULL),
+    (5,  'TD-FULL-A-E005', 1, 1, 11, 8, 5,  45260, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 11 MINUTE), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 11 MINUTE), 'PRIMARY', 'ACCEPTED', 5,  NULL, NULL, NULL, NULL, NULL),
+    (6,  'TD-FULL-A-E006', 1, 1, 4,  3, 6,  46040, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 10 MINUTE), DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 10 MINUTE), 'PRIMARY', 'ACCEPTED', 6,  NULL, NULL, NULL, NULL, NULL),
+    (7,  'TD-FULL-A-E007', 1, 1, 1,  2, 7,  43050, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 9 MINUTE),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 9 MINUTE),  'PRIMARY', 'ACCEPTED', 7,  NULL, NULL, NULL, NULL, NULL),
+    (8,  'TD-FULL-A-E008', 1, 1, 2,  3, 8,  43310, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 8 MINUTE),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 8 MINUTE),  'PRIMARY', 'ACCEPTED', 8,  NULL, NULL, NULL, NULL, NULL),
+    (9,  'TD-FULL-A-E009', 1, 1, 3,  4, 9,  44580, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 8 MINUTE),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 8 MINUTE),  'PRIMARY', 'ACCEPTED', 9,  NULL, NULL, NULL, NULL, NULL),
+    (10, 'TD-FULL-A-E010', 1, 1, 11, 8, 10, 44970, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 7 MINUTE),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 7 MINUTE),  'PRIMARY', 'ACCEPTED', 10, NULL, NULL, NULL, NULL, NULL),
+    (11, 'TD-FULL-A-E011', 1, 1, 8,  4, 11, 55230, 'OUT',   DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 6 MINUTE),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 6 MINUTE),  'PRIMARY', 'ACCEPTED', 11, NULL, NULL, NULL, NULL, NULL),
+    (12, 'TD-FULL-A-E012', 1, 1, 4,  3, 12, 61240, 'CRASH', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 6 MINUTE),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 6 MINUTE),  'PRIMARY', 'ACCEPTED', 12, NULL, NULL, NULL, NULL, NULL),
+    (13, 'TD-FULL-A-E013', 1, 1, 2,  3, 13, 42980, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 5 MINUTE),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 5 MINUTE),  'PRIMARY', 'ACCEPTED', 13, NULL, NULL, NULL, NULL, NULL),
+    (14, 'TD-FULL-A-E014', 1, 1, 1,  2, 14, 43410, 'VALID', DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 4 MINUTE),  DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 4 MINUTE),  'PRIMARY', 'ACCEPTED', 14, NULL, NULL, NULL, NULL, NULL);
+
+-- 第 3 场接管边界两侧各两条事件：旧主 1-2 正常、备用 3-4 正常；
+-- 旧主晚到的边界后事件 1 条进隔离区（未处置），另 1 条已被主管丢弃（演示隔离区处置）。
+INSERT INTO timing_lap_event (id, event_uid, device_id, session_id, driver_id, kart_id, seq,
+                              lap_time_ms, valid, occurred_at, received_at, source_role,
+                              stage, lap_id, gap_id, quarantine_reason, quarantine_note,
+                              decided_by, decided_at) VALUES
+    (15, 'TD-OLD-A-E001', 7, 3, 1, 2, 1, 42350, 'VALID',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY) + INTERVAL 2 MINUTE,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY) + INTERVAL 2 MINUTE,
+     'PRIMARY', 'ACCEPTED', 15, NULL, NULL, NULL, NULL, NULL),
+    (16, 'TD-OLD-A-E002', 7, 3, 2, 3, 2, 43020, 'VALID',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY) + INTERVAL 8 MINUTE,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY) + INTERVAL 8 MINUTE,
+     'PRIMARY', 'ACCEPTED', 16, NULL, NULL, NULL, NULL, NULL),
+    (17, 'TD-OLD-B-E003', 8, 3, 11, 8, 3, 44780, 'VALID',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY) + INTERVAL 12 MINUTE,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY) + INTERVAL 12 MINUTE,
+     'STANDBY', 'ACCEPTED', 17, NULL, NULL, NULL, NULL, NULL),
+    (18, 'TD-OLD-B-E004', 8, 3, 5, 4, 4, 47890, 'VALID',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY) + INTERVAL 16 MINUTE,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY) + INTERVAL 16 MINUTE,
+     'STANDBY', 'ACCEPTED', 18, NULL, NULL, NULL, NULL, NULL),
+    (19, 'TD-OLD-A-E003', 7, 3, 2, 3, 3, 42880, 'VALID',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY) + INTERVAL 13 MINUTE,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 23 HOUR),
+     'PRIMARY', 'QUARANTINED', NULL, NULL, 'OLD_AFTER_BOUNDARY',
+     '旧主设备晚到的边界后圈速（产生于接管时刻之后），未入本场成绩', NULL, NULL),
+    (20, 'TD-OLD-A-E004', 7, 3, 2, 3, 4, 43110, 'VALID',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 1 DAY) + INTERVAL 17 MINUTE,
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 23 HOUR),
+     'PRIMARY', 'DISCARDED', NULL, NULL, 'OLD_AFTER_BOUNDARY',
+     '旧主设备晚到的边界后圈速，主管核对原始触发记录后丢弃', '王主管',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 23 HOUR) + INTERVAL 10 MINUTE);
+
+-- 设备告警种子：离线设备 D 一条待确认告警。
+INSERT INTO timing_alert (id, device_id, session_id, type, message, status, raised_at,
+                          acked_by, acked_at, dedup_key) VALUES
+    (1, 4, 1, 'OFFLINE', '全场检测点 D（离线）已超过 30 秒无心跳，判定离线', 'ACTIVE',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 330 SECOND),
+     NULL, NULL, 'dev4:OFFLINE'),
+    (2, 1, 1, 'GAP', '全场主计时门 A 圈速序号缺失 15~15，#16、#17 已保留为待对账，等待设备断线重放补齐', 'ACTIVE',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 2 MINUTE),
+     NULL, NULL, 'dev1:GAP');
+
+-- 当前主设备 A 的断线场景：已确认到 #14，#15 缺失（OPEN 缺口），#16/#17 已先到但只能挂待对账。
+INSERT INTO timing_gap (id, device_id, session_id, missing_from, missing_to, status, opened_at,
+                        filled_at, pending_count) VALUES
+    (1, 1, 1, 15, 15, 'OPEN',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 2 MINUTE), NULL, 2);
+
+INSERT INTO timing_lap_event (id, event_uid, device_id, session_id, driver_id, kart_id, seq,
+                              lap_time_ms, valid, occurred_at, received_at, source_role,
+                              stage, lap_id, gap_id, quarantine_reason, quarantine_note,
+                              decided_by, decided_at) VALUES
+    (21, 'TD-FULL-A-E016', 1, 1, 2, 3, 16, 43120, 'VALID',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 3 MINUTE),
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 2 MINUTE),
+     'PRIMARY', 'PENDING', NULL, 1, NULL, NULL, NULL, NULL),
+    (22, 'TD-FULL-A-E017', 1, 1, 1, 2, 17, 42860, 'VALID',
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 150 SECOND),
+     DATE_SUB(DATE_ADD(UTC_TIMESTAMP(), INTERVAL 8 HOUR), INTERVAL 2 MINUTE),
+     'PRIMARY', 'PENDING', NULL, 1, NULL, NULL, NULL, NULL);
 
 SET FOREIGN_KEY_CHECKS = 1;

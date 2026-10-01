@@ -24,6 +24,7 @@ import com.kart.track.repository.LapRecordRepository;
 import com.kart.track.repository.RaceSessionRepository;
 import com.kart.track.repository.RedFlagEventRepository;
 import com.kart.track.repository.RedFlagLapRepository;
+import com.kart.track.repository.TimingTakeoverRepository;
 
 /** 模块三：场次（待开赛 → 进行中 → 已结束 / 已取消）。 */
 @Service
@@ -35,19 +36,22 @@ public class SessionService {
     private final LapRecordRepository lapRecordRepository;
     private final RedFlagEventRepository redFlagEventRepository;
     private final RedFlagLapRepository redFlagLapRepository;
+    private final TimingTakeoverRepository timingTakeoverRepository;
 
     public SessionService(RaceSessionRepository sessionRepository,
                           DriverRepository driverRepository,
                           KartRepository kartRepository,
                           LapRecordRepository lapRecordRepository,
                           RedFlagEventRepository redFlagEventRepository,
-                          RedFlagLapRepository redFlagLapRepository) {
+                          RedFlagLapRepository redFlagLapRepository,
+                          TimingTakeoverRepository timingTakeoverRepository) {
         this.sessionRepository = sessionRepository;
         this.driverRepository = driverRepository;
         this.kartRepository = kartRepository;
         this.lapRecordRepository = lapRecordRepository;
         this.redFlagEventRepository = redFlagEventRepository;
         this.redFlagLapRepository = redFlagLapRepository;
+        this.timingTakeoverRepository = timingTakeoverRepository;
     }
 
     @Transactional(readOnly = true)
@@ -104,6 +108,9 @@ public class SessionService {
         RaceSession session = sessionRepository.findById(id).orElseThrow(() -> new BizException("场次不存在"));
         if (redFlagEventRepository.findBySessionIdAndStatus(session.getId(), "ACTIVE").isPresent()) {
             throw new BizException("本场红旗处理中，必须先由主管「恢复比赛」或「强制终止」");
+        }
+        if (timingTakeoverRepository.findBySessionIdAndStatus(session.getId(), "REQUESTED").isPresent()) {
+            throw new BizException("本场存在待主管执行的计时设备接管请求，请先执行/驳回后再结束场次");
         }
         if (!"RUNNING".equals(session.getStatus())) {
             throw new BizException("只有「进行中」的场次可以结束");
