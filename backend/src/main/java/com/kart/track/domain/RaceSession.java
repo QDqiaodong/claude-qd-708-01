@@ -49,4 +49,8 @@ public class RaceSession {
     /** PENDING 待开赛 / RUNNING 进行中 / FINISHED 已结束 / CANCELED 已取消 */
     @Column(name = "status", nullable = false, length = 16)
     private String status;
+
+    /** 当前计时数据来源设备（韧性台主备接管边界生效时原子切换；为 NULL 表示沿用本场所绑定的主设备） */
+    @Column(name = "current_source_device_id")
+    private Long currentSourceDeviceId;
 }

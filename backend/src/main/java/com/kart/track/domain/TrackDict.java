@@ -101,6 +101,58 @@ public final class TrackDict {
             "STAFF", "值班人员",
             "SUPERVISOR", "主管");
 
+    // ---------------- 计时设备（模块九：韧性台） ----------------
+    private static final Map<String, String> DEVICE_ROLE = Map.of(
+            "PRIMARY", "主设备",
+            "BACKUP", "备用设备");
+
+    /** 心跳状态：在线 / 波动（序号异常或心跳间隔拉长）/ 离线 / 隔离 */
+    private static final Map<String, String> DEVICE_HEARTBEAT_STATUS = Map.of(
+            "ONLINE", "在线",
+            "FLAPPING", "波动",
+            "OFFLINE", "离线",
+            "ISOLATED", "隔离",
+            "UNBOUND", "未关联");
+
+    /** 圈速事件状态 */
+    private static final Map<String, String> LAP_EVENT_STATUS = Map.of(
+            "CONFIRMED", "已确认",
+            "PENDING", "待对账",
+            "QUARANTINED", "隔离区",
+            "VOID", "已丢弃");
+
+    /** 进入隔离区的原因 */
+    private static final Map<String, String> QUARANTINE_REASON = Map.of(
+            "LATE_PRIMARY", "旧主设备·边界后事件",
+            "EARLY_BACKUP", "备用设备·边界前事件",
+            "SEQ_REGRESSION", "序号倒退",
+            "MANUAL", "人工隔离");
+
+    /** 缺口状态 */
+    private static final Map<String, String> GAP_STATUS = Map.of(
+            "OPEN", "缺口未补",
+            "FILLED", "已补齐");
+
+    /** 接管请求状态 */
+    private static final Map<String, String> TAKEOVER_STATUS = Map.of(
+            "REQUESTED", "待主管审批",
+            "APPROVED", "已接管",
+            "REJECTED", "已驳回",
+            "CANCELED", "已撤回");
+
+    /** 韧性台告警类型 */
+    private static final Map<String, String> ALERT_TYPE = Map.of(
+            "GAP", "序号缺口",
+            "JUMP", "序号倒退",
+            "FLAPPING", "心跳波动",
+            "OFFLINE", "心跳超时离线",
+            "TAKEOVER_REQ", "接管请求",
+            "QUARANTINED", "设备隔离");
+
+    /** 心跳阈值：15 秒内在线；15~30 秒波动；超过 30 秒离线 */
+    public static final int HEARTBEAT_ONLINE_SECONDS = 15;
+    public static final int HEARTBEAT_FLAPPING_SECONDS = 30;
+
     // ---------------- 圈速 ----------------
     private static final Map<String, String> LAP_VALID = Map.of(
             "VALID", "有效",
@@ -295,5 +347,61 @@ public final class TrackDict {
             return "—";
         }
         return String.format("+%.3f", diff / 1000.0);
+    }
+
+    // ---------------- 计时设备取值方法 ----------------
+
+    public static boolean isValidDeviceRole(String role) {
+        return role != null && DEVICE_ROLE.containsKey(role);
+    }
+
+    public static String deviceRoleName(String role) {
+        return role == null ? "" : DEVICE_ROLE.getOrDefault(role, role);
+    }
+
+    public static String heartbeatStatusName(String status) {
+        return status == null ? "" : DEVICE_HEARTBEAT_STATUS.getOrDefault(status, status);
+    }
+
+    public static String lapEventStatusName(String status) {
+        return status == null ? "" : LAP_EVENT_STATUS.getOrDefault(status, status);
+    }
+
+    public static String quarantineReasonName(String reason) {
+        return reason == null ? "" : QUARANTINE_REASON.getOrDefault(reason, reason);
+    }
+
+    public static String gapStatusName(String status) {
+        return status == null ? "" : GAP_STATUS.getOrDefault(status, status);
+    }
+
+    public static String takeoverStatusName(String status) {
+        return status == null ? "" : TAKEOVER_STATUS.getOrDefault(status, status);
+    }
+
+    public static String alertTypeName(String type) {
+        return type == null ? "" : ALERT_TYPE.getOrDefault(type, type);
+    }
+
+    /** 依据最后心跳距今秒数与隔离/关联标记推导心跳状态 */
+    public static String heartbeatStatus(boolean quarantined, Long boundSessionId, boolean jitter,
+                                     java.time.LocalDateTime lastHeartbeatAt, java.time.LocalDateTime now) {
+        if (quarantined) {
+            return "ISOLATED";
+        }
+        if (boundSessionId == null) {
+            return "UNBOUND";
+        }
+        if (lastHeartbeatAt == null) {
+            return "OFFLINE";
+        }
+        long ageSec = java.time.Duration.between(lastHeartbeatAt, now).getSeconds();
+        if (ageSec > HEARTBEAT_FLAPPING_SECONDS) {
+            return "OFFLINE";
+        }
+        if (jitter || ageSec > HEARTBEAT_ONLINE_SECONDS) {
+            return "FLAPPING";
+        }
+        return "ONLINE";
     }
 }

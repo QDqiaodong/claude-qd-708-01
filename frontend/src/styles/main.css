@@ -117,6 +117,12 @@ body {
   animation: redflag-pulse 1.4s infinite;
 }
 
+.stat-chip.is-timing {
+  background: #0d47a1;
+  color: #fff;
+  animation: redflag-pulse 1.4s infinite;
+}
+
 @keyframes redflag-pulse {
   0% { box-shadow: 0 0 0 0 rgba(255, 82, 82, 0.55); }
   70% { box-shadow: 0 0 0 8px rgba(255, 82, 82, 0); }

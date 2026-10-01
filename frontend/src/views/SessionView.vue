@@ -36,6 +36,7 @@
             <el-button v-if="row.status === 'PENDING'" link type="danger" @click="act(row, 'cancel')">取消</el-button>
             <el-button v-if="row.redFlagActive" link type="danger" @click="openConsole(row)">🚩 红旗处置台</el-button>
             <el-button v-if="row.redFlagCount" link @click="openConsole(row)">红旗记录 {{ row.redFlagCount }}</el-button>
+            <el-button link type="primary" @click="openTiming(row)">📡 计时韧性台</el-button>
             <el-button link @click="focus(row)">设为本场</el-button>
           </template>
         </el-table-column>
@@ -131,6 +132,11 @@ function focus(row) {
 function openConsole(row) {
   track.sessionId.value = row.id
   nav.push('/red-flag')
+}
+
+function openTiming(row) {
+  track.sessionId.value = row.id
+  nav.push('/timing')
 }
 
 watch(() => track.sessionId.value, () => load())

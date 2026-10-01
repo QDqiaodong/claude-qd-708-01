@@ -105,3 +105,22 @@ export const redFlagApi = {
   resume: (eventId) => http.post(`/red-flags/events/${eventId}/resume`),
   terminate: (eventId) => http.post(`/red-flags/events/${eventId}/terminate`)
 }
+
+/** 模块九：计时设备韧性台（心跳 / 事件顺序校验 / 断线补偿 / 主备接管 / 隔离区） */
+export const timingApi = {
+  console: (sessionId) => http.get('/timing/console', { params: sessionId ? { sessionId } : {} }),
+  register: (data) => http.post('/timing/devices/register', data),
+  bind: (id, sessionId, version) => http.post(`/timing/devices/${id}/bind`, { sessionId, version }),
+  unbind: (id, version) => http.post(`/timing/devices/${id}/unbind`, { version }),
+  heartbeat: (deviceNo, seqNo) => http.post(`/timing/devices/${encodeURIComponent(deviceNo)}/heartbeat`, { seqNo }),
+  ingest: (deviceNo, data) => http.post(`/timing/devices/${encodeURIComponent(deviceNo)}/events`, data),
+  replay: (deviceNo, events) => http.post(`/timing/devices/${encodeURIComponent(deviceNo)}/events/replay`, events),
+  requestTakeover: (sessionId, data) => http.post(`/timing/sessions/${sessionId}/takeovers/request`, data),
+  approveTakeover: (id) => http.post(`/timing/takeovers/${id}/approve`),
+  rejectTakeover: (id, reason) => http.post(`/timing/takeovers/${id}/reject`, { reason }),
+  cancelTakeover: (id) => http.post(`/timing/takeovers/${id}/cancel`),
+  quarantine: (id, reason, version) => http.post(`/timing/devices/${id}/quarantine`, { reason, version }),
+  releaseQuarantine: (id, version) => http.post(`/timing/devices/${id}/release-quarantine`, { version }),
+  ruleEvent: (id, action) => http.post(`/timing/events/${id}/rule`, { action }),
+  ackAlert: (id) => http.post(`/timing/alerts/${id}/ack`)
+}

@@ -236,6 +236,130 @@ public class LapRecordService {
         return false;
     }
 
+    /**
+     * 计时设备韧性台专用的圈速落账入口（序号连续、来源有效的事件确认时调用）。
+     *
+     * <p>与人工登记共用同一套规则，绝不复制第二份：
+     * <ul>
+     *   <li>事件实际产生时刻 occurredAt 落在某段红旗窗口（或场次当前红旗处理中）→ lap_record 照常留底、
+     *       不写最快圈/不刷车手历史最好，同时挂一条 PENDING 红旗裁定，由主管逐条裁定，不绕过红旗规则；</li>
+     *   <li>正常时段 → 正常入计圈链：最快圈复位、车手历史最好、车辆里程工时一并更新。</li>
+     * </ul>
+     * 设备上报的车手/车辆配对视为权威（派车在设备侧完成），这里只校验存在性，不再重复驾照门槛。
+     * 幂等由调用方按（设备, eventUid）唯一约束保证，同一事件不会进到这里第二次。
+     *
+     * @return 落账结果：lapId 圈速记录 id；redFlag 是否挂红旗待裁定；redFlagEventId 对应红旗事件
+     */
+    AcceptedLap acceptTimingLap(Long sessionId, Long driverId, Long kartId, Integer ms, String valid,
+                              LocalDateTime occurredAt) {
+        RaceSession session = sessionRepository.findById(sessionId)
+                .orElseThrow(() -> new BizException("场次不存在"));
+        RedFlagEvent activeRedFlag = redFlagEventRepository
+                .findBySessionIdAndStatus(session.getId(), "ACTIVE").orElse(null);
+        // 事件实际产生时刻优先：断线重放在「恢复后」补回的圈，只要产生时刻落在某次红旗窗口内，仍挂红旗待裁定；
+        // 没有产生时刻（不会发生，设备事件必填）或窗口外，再退回按场次当前状态判定。
+        RedFlagEvent windowRedFlag = redFlagAt(session.getId(), activeRedFlag, occurredAt);
+        boolean underRedFlag = windowRedFlag != null || "RED_FLAG".equals(session.getStatus()) || activeRedFlag != null;
+        if (windowRedFlag == null) {
+            windowRedFlag = activeRedFlag;
+        }
+        if (!"RUNNING".equals(session.getStatus()) && !underRedFlag) {
+            throw new BizException("只有「进行中」的场次才能确认圈速，当前为"
+                    + TrackDict.sessionStatusName(session.getStatus()));
+        }
+        Driver driver = driverRepository.findById(driverId).orElseThrow(() -> new BizException("车手不存在"));
+        Kart kart = kartRepository.findById(kartId).orElseThrow(() -> new BizException("车辆不存在"));
+        String useValid = valid == null || valid.isBlank() ? "VALID" : valid;
+        if (!TrackDict.isValidLapValid(useValid)) {
+            throw new BizException("圈速判定只能是 有效/无效-出界/无效-碰撞");
+        }
+
+        int lapIndex = (int) lapRecordRepository.findByDriverIdOrderByLapTimeMsAsc(driver.getId()).stream()
+                .filter(lap -> lap.getSessionId().equals(session.getId()))
+                .count() + 1;
+
+        LapRecord lap = new LapRecord();
+        lap.setSessionId(session.getId());
+        lap.setDriverId(driver.getId());
+        lap.setKartId(kart.getId());
+        lap.setLapIndex(lapIndex);
+        lap.setLapTimeMs(ms);
+        lap.setValid(useValid);
+        lap.setCreatedAt(occurredAt != null ? occurredAt : LocalDateTime.now());
+
+        boolean fastest = false;
+        if (!underRedFlag && "VALID".equals(useValid)) {
+            Integer currentBest = null;
+            for (LapRecord old : lapRecordRepository.findBySessionIdAndValidOrderByLapTimeMsAsc(session.getId(), "VALID")) {
+                currentBest = old.getLapTimeMs();
+                break;
+            }
+            fastest = currentBest == null || ms < currentBest;
+            if (fastest && currentBest != null) {
+                for (LapRecord old : lapRecordRepository.findBySessionIdOrderByCreatedAtDesc(session.getId())) {
+                    if (old.isFastest()) {
+                        old.setFastest(false);
+                        lapRecordRepository.save(old);
+                    }
+                }
+            }
+        }
+        lap.setFastest(fastest);
+        LapRecord saved = lapRecordRepository.save(lap);
+
+        if (underRedFlag) {
+            RedFlagLap pending = new RedFlagLap();
+            pending.setLapId(saved.getId());
+            pending.setEventId(windowRedFlag.getId());
+            pending.setSessionId(session.getId());
+            pending.setRuling("PENDING");
+            redFlagLapRepository.save(pending);
+            return new AcceptedLap(saved.getId(), true, windowRedFlag.getId());
+        }
+        if ("VALID".equals(useValid)) {
+            if (driver.getBestLapMs() == null || driver.getBestLapMs() <= 0 || ms < driver.getBestLapMs()) {
+                driver.setBestLapMs(ms);
+                driverRepository.save(driver);
+            }
+            BigDecimal km = TrackDict.configLapKm(session.getTrackConfig());
+            kart.setTotalKm(kart.getTotalKm().add(km));
+            kart.setTotalHours(kart.getTotalHours().add(BigDecimal.valueOf(ms / 3600000.0)));
+            kart.setUpdatedAt(LocalDateTime.now());
+            kartRepository.save(kart);
+        }
+        return new AcceptedLap(saved.getId(), false, null);
+    }
+
+    /** 韧性台事件确认落账结果 */
+    record AcceptedLap(Long lapId, boolean redFlag, Long redFlagEventId) {
+    }
+
+    /**
+     * 判断事件实际产生时刻是否落在本场某次红旗窗口内（occurred_at ∈ [发起, 恢复/终止]）。
+     * 当前已生效中的红旗直接命中；否则遍历已结束红旗——设备断线恢复重放的旧圈必须仍挂红旗待裁定。
+     */
+    private RedFlagEvent redFlagAt(Long sessionId, RedFlagEvent active, LocalDateTime at) {
+        if (at == null) {
+            return active;
+        }
+        if (active != null && !at.isBefore(active.getOccurredAt())) {
+            return active;
+        }
+        for (RedFlagEvent event : redFlagEventRepository.findAllBySessionIdOrderByOccurredAtDesc(sessionId)) {
+            if ("ACTIVE".equals(event.getStatus())) {
+                if (!at.isBefore(event.getOccurredAt())) {
+                    return event;
+                }
+                continue;
+            }
+            LocalDateTime closedAt = event.getResumedAt() != null ? event.getResumedAt() : event.getTerminatedAt();
+            if (!at.isBefore(event.getOccurredAt()) && closedAt != null && !at.isAfter(closedAt)) {
+                return event;
+            }
+        }
+        return null;
+    }
+
     /** 改判：有效 ↔ 无效-出界 / 无效-碰撞（走 @SQLUpdate）。红旗期间记录受隔离，只能由主管在处置台裁定 */
     @Transactional
     public Views.LapRecordView setValid(Long id, LapRecordDtos.LapValidReq req) {

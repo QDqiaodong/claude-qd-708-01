@@ -21,6 +21,7 @@ import com.kart.track.domain.Maintenance;
 import com.kart.track.domain.RaceSession;
 import com.kart.track.domain.RedFlagEvent;
 import com.kart.track.domain.RedFlagLap;
+import com.kart.track.domain.TimingDevice;
 import com.kart.track.domain.TrackDict;
 import com.kart.track.dto.Views;
 import com.kart.track.repository.DriverRepository;
@@ -30,6 +31,8 @@ import com.kart.track.repository.MaintenanceRepository;
 import com.kart.track.repository.RaceSessionRepository;
 import com.kart.track.repository.RedFlagEventRepository;
 import com.kart.track.repository.RedFlagLapRepository;
+import com.kart.track.repository.TimingDeviceRepository;
+import com.kart.track.repository.DeviceAlertRepository;
 
 /** 首页「赛道实况」：大计时器 + 场次信息条 + 赛道点位 + 实时圈速排行榜。 */
 @Service
@@ -42,6 +45,8 @@ public class TrackService {
     private final MaintenanceRepository maintenanceRepository;
     private final RedFlagLapRepository redFlagLapRepository;
     private final RedFlagEventRepository redFlagEventRepository;
+    private final TimingDeviceRepository timingDeviceRepository;
+    private final DeviceAlertRepository deviceAlertRepository;
 
     public TrackService(RaceSessionRepository sessionRepository,
                         LapRecordRepository lapRecordRepository,
@@ -49,7 +54,9 @@ public class TrackService {
                         KartRepository kartRepository,
                         MaintenanceRepository maintenanceRepository,
                         RedFlagLapRepository redFlagLapRepository,
-                        RedFlagEventRepository redFlagEventRepository) {
+                        RedFlagEventRepository redFlagEventRepository,
+                        TimingDeviceRepository timingDeviceRepository,
+                        DeviceAlertRepository deviceAlertRepository) {
         this.sessionRepository = sessionRepository;
         this.lapRecordRepository = lapRecordRepository;
         this.driverRepository = driverRepository;
@@ -57,6 +64,8 @@ public class TrackService {
         this.maintenanceRepository = maintenanceRepository;
         this.redFlagLapRepository = redFlagLapRepository;
         this.redFlagEventRepository = redFlagEventRepository;
+        this.timingDeviceRepository = timingDeviceRepository;
+        this.deviceAlertRepository = deviceAlertRepository;
     }
 
     /** 顶栏计数器 */
@@ -78,6 +87,7 @@ public class TrackService {
         }
         long redFlagActive = sessionRepository.countByStatus("RED_FLAG");
         long pendingLaps = redFlagLapRepository.countByRuling("PENDING");
+        long timingIsolated = timingDeviceRepository.findAll().stream().filter(TimingDevice::isQuarantined).count();
         return new Views.Overview(
                 kartRepository.count(),
                 kartRepository.countByStatus("AVAILABLE"),
@@ -92,7 +102,10 @@ public class TrackService {
                 maintDone,
                 fee,
                 redFlagActive,
-                pendingLaps);
+                pendingLaps,
+                timingDeviceRepository.count(),
+                deviceAlertRepository.countByStatus("ACTIVE"),
+                timingIsolated);
     }
 
     /**
